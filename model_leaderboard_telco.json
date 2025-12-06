@@ -1,0 +1,31 @@
+[
+  {
+    "name": "grad_boost",
+    "type": "sklearn",
+    "auc": 0.8433620088351547
+  },
+  {
+    "name": "logreg",
+    "type": "sklearn",
+    "auc": 0.8418610659019866
+  },
+  {
+    "name": "sgd_logloss",
+    "type": "sklearn",
+    "auc": 0.8296442687747035
+  },
+  {
+    "name": "random_forest",
+    "type": "sklearn",
+    "auc": 0.8169598801312358
+  },
+  {
+    "name": "keras_mlp",
+    "type": "keras",
+    "auc": 0.8385491746105558,
+    "accuracy": 0.7991483321504613,
+    "grad_abs_mean": 0.0022562441881746054,
+    "grad_abs_max": 0.14776118099689484,
+    "grad_std": 0.005482475273311138
+  }
+]
