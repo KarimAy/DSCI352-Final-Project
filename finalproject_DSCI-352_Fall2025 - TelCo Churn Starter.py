@@ -36,6 +36,10 @@ import pandas as pd
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
+from tensorflow.keras import Sequential
+from tensorflow.keras.layers import Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.metrics import AUC
 
 from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer
@@ -207,7 +211,17 @@ def build_keras_model(input_dim: int):
     Return:
       - a compiled Keras model ready for training.
     """
-    raise NotImplementedError("TODO: implement build_keras_model(input_dim).")
+    model = Sequential()
+    model.add(layers.Input(shape=(input_dim,)))
+    model.add(Dense(64, activation='relu'))
+    model.add(Dropout(0.3))
+    model.add(Dense(32, activation='relu'))
+    model.add(Dropout(0.2))
+    model.add(Dense(1, activation='sigmoid'))
+
+    model.compile(optimizer = Adam(learning_rate=1e-3), loss = 'binary_crossentropy', metrics = [AUC(name="auc"), 'accuracy'])
+
+    return model
 
 ############################
 # Scikit-Learn Models – TODO
@@ -247,8 +261,48 @@ def train_sklearn_models(preprocessor, X, y):
       - sgd_model: the chosen SGD-based pipeline for deployment
       - sgd_auc: AUC of that SGD model
     """
-    raise NotImplementedError("TODO: implement train_sklearn_models(preprocessor, X, y).")
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
 
+    models = [
+        ("logreg", LogisticRegression(max_iter=500)),
+        ("random_forest", RandomForestClassifier(n_estimators=300, random_state=42)),
+        ("grad_boost", GradientBoostingClassifier(random_state=42)),
+        ("sgd_logloss", SGDClassifier(loss="log_loss", max_iter=1000, random_state=42)),
+    ]
+
+    # Predefine these because we are going to be defining them in the for loop
+    results = []
+    sgd_model = None
+    auc_of_sgd = None
+
+    for name, classifier in models:
+        pipe = Pipeline(steps=[('preprocessor', preprocessor), ('classifier', classifier)])
+        pipe.fit(X_train, y_train)
+
+        # Make sure the model has attribute predict_proba before calling it
+        if hasattr(classifier, "predict_proba"):
+            y_val_scores = pipe.predict_proba(X_val)[:, 1]
+
+        # ChatGPT recommended to add these 2 safety features incase the classifier does not have the attribute "predict_proba" so that no error is caused.
+        elif hasattr(classifier, "decision_function"):
+            # e.g. SGDClassifier with log_loss
+            y_val_scores = pipe.decision_function(X_val)
+        else:
+            # fallback (not ideal for AUC, but just in case)
+            y_val_scores = pipe.predict(X_val)
+
+        auc = roc_auc_score(y_val, y_val_scores)
+        results.append((name, pipe, auc))
+
+    # remember the SGD model separately for deployment - ChatGPT generated
+        if isinstance(classifier, SGDClassifier):
+            sgd_model = pipe
+            auc_of_sgd = auc
+
+    # rank the models - ChatGPT generated
+    results.sort(key=lambda t: t[2], reverse=True)
+
+    return results, (X_train, X_val, y_train, y_val), sgd_model, auc_of_sgd
 
 ################################################
 # 4) Lightweight Artifact for AWS – TODO (Bonus)
@@ -486,6 +540,41 @@ def main():
             "  2) Setting ENABLE_AWS_EXPORT = True near the top of this file.\n"
             "  3) Implementing build_lightweight_artifact(...).\n"
         )
+
+    # =========================
+# MANUAL ARTIFACT BUILDER (Simplified)
+# =========================
+
+def save_telco_artifact(best_model, preprocessor, numeric_features, categorical_features):
+    """
+    Saves a minimal artifact containing:
+      - Best sklearn model
+      - Preprocessor (ColumnTransformer)
+      - Feature lists
+    """
+    import pickle
+
+    artifact = {
+        "best_model": best_model,
+        "preprocessor": preprocessor,
+        "numeric_features": numeric_features,
+        "categorical_features": categorical_features,
+    }
+
+    with open("telco_artifact.pkl", "wb") as f:
+        pickle.dump(artifact, f)
+
+    print("\nSaved lightweight artifact → telco_artifact.pkl")
+
+
+# CALL ARTIFACT BUILDER AFTER MAIN TRAINING
+# (This runs even when ENABLE_AWS_EXPORT=False)
+save_telco_artifact(
+    best_model=best_sklearn_model,
+    preprocessor=preprocessor,
+    numeric_features=num_feats,
+    categorical_features=cat_feats
+)
 
 
 if __name__ == "__main__":

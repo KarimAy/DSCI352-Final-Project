@@ -1,0 +1,280 @@
+"""
+Telco Churn Training Script — Local Version (No AWS)
+This trains sklearn + Keras models, compares performance,
+tracks gradients, and outputs:
+    - keras_gradients.json
+    - model_leaderboard_telco.json
+    - sgd_pipeline.pkl     ← used by prediction pipeline
+"""
+
+import os
+import json
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers, Sequential
+from tensorflow.keras.layers import Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.metrics import AUC
+
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import roc_auc_score, accuracy_score
+from sklearn.linear_model import LogisticRegression, SGDClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+
+import joblib
+
+
+LOCAL_CSV = "WA_Fn-UseC_-Telco-Customer-Churn.csv"
+
+
+# ---------------------------
+#  Load CSV and clean
+# ---------------------------
+def load_telco(path: str):
+    df = pd.read_csv(path)
+    df["TotalCharges"] = pd.to_numeric(df["TotalCharges"], errors="coerce")
+    df["Churn"] = df["Churn"].map({"Yes": 1, "No": 0})
+    df = df.drop(columns=["customerID"], errors="ignore")
+    return df
+
+
+# ---------------------------
+#  Preprocessing
+# ---------------------------
+def build_preprocessor(df):
+    X = df.drop("Churn", axis=1)
+    y = df["Churn"]
+
+    numeric_features = X.select_dtypes(include=["int64", "float64"]).columns.tolist()
+    categorical_features = X.select_dtypes(include=["object", "bool"]).columns.tolist()
+
+    numeric_transformer = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+        ]
+    )
+
+    categorical_transformer = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            (
+                "onehot",
+                OneHotEncoder(handle_unknown="ignore", sparse_output=False),
+            ),
+        ]
+    )
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", numeric_transformer, numeric_features),
+            ("cat", categorical_transformer, categorical_features),
+        ]
+    )
+
+    return preprocessor, X, y, numeric_features, categorical_features
+
+
+# ---------------------------
+# Keras dataset conversion
+# ---------------------------
+def make_numpy_for_keras(preprocessor, X_train, X_val):
+    preprocessor.fit(X_train)
+    X_train_p = preprocessor.transform(X_train).astype("float32")
+    X_val_p = preprocessor.transform(X_val).astype("float32")
+
+    ohe = preprocessor.named_transformers_["cat"].named_steps["onehot"]
+    cat_names = ohe.get_feature_names_out()
+    num_names = preprocessor.transformers_[0][2]
+
+    feature_names = np.concatenate([num_names, cat_names])
+    return X_train_p, X_val_p, feature_names
+
+
+# ---------------------------
+# Gradient Tracker
+# ---------------------------
+class GradientTracker(keras.callbacks.Callback):
+    def __init__(self, model, sample_x, sample_y):
+        super().__init__()
+        self.model_ref = model
+        self.sample_x = tf.convert_to_tensor(sample_x)
+        self.sample_y = tf.convert_to_tensor(sample_y, dtype=tf.float32)
+        self.history = []
+
+    def on_epoch_end(self, epoch, logs=None):
+        with tf.GradientTape() as tape:
+            preds = self.model_ref(self.sample_x, training=True)
+            preds = tf.squeeze(preds, axis=-1)
+            loss = keras.losses.binary_crossentropy(self.sample_y, preds)
+            loss = tf.reduce_mean(loss)
+
+        grads = tape.gradient(loss, self.model_ref.trainable_weights)
+        grad_vals = [tf.reshape(g, [-1]) for g in grads if g is not None]
+
+        if grad_vals:
+            allg = tf.concat(grad_vals, axis=0)
+            gm = tf.reduce_mean(tf.abs(allg)).numpy().item()
+            gmax = tf.reduce_max(tf.abs(allg)).numpy().item()
+            gstd = tf.math.reduce_std(allg).numpy().item()
+        else:
+            gm = gmax = gstd = 0.0
+
+        self.history.append(
+            {
+                "epoch": int(epoch),
+                "grad_abs_mean": gm,
+                "grad_abs_max": gmax,
+                "grad_std": gstd,
+                "logs": logs or {},
+            }
+        )
+
+
+# ---------------------------
+# Keras Model
+# ---------------------------
+def build_keras_model(input_dim):
+    model = Sequential()
+    model.add(layers.Input(shape=(input_dim,)))
+    model.add(Dense(64, activation="relu"))
+    model.add(Dropout(0.3))
+    model.add(Dense(32, activation="relu"))
+    model.add(Dropout(0.2))
+    model.add(Dense(1, activation="sigmoid"))
+
+    model.compile(
+        optimizer=Adam(1e-3),
+        loss="binary_crossentropy",
+        metrics=[AUC(name="auc"), "accuracy"],
+    )
+    return model
+
+
+# ---------------------------
+# Sklearn Models
+# ---------------------------
+def train_sklearn_models(preprocessor, X, y):
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    model_defs = [
+        ("logreg", LogisticRegression(max_iter=500)),
+        ("random_forest", RandomForestClassifier(n_estimators=300, random_state=42)),
+        ("grad_boost", GradientBoostingClassifier(random_state=42)),
+        ("sgd_logloss", SGDClassifier(loss="log_loss", max_iter=1000, random_state=42)),
+    ]
+
+    results = []
+    sgd_model = None
+    sgd_auc = None
+
+    for name, clf in model_defs:
+        pipe = Pipeline([("prep", preprocessor), ("clf", clf)])
+        pipe.fit(X_train, y_train)
+
+        if hasattr(pipe.named_steps["clf"], "predict_proba"):
+            scores = pipe.predict_proba(X_val)[:, 1]
+        elif hasattr(pipe.named_steps["clf"], "decision_function"):
+            scores = pipe.decision_function(X_val)
+        else:
+            scores = pipe.predict(X_val)
+
+        auc = roc_auc_score(y_val, scores)
+        results.append((name, pipe, auc))
+
+        if name == "sgd_logloss":
+            sgd_model = pipe
+            sgd_auc = auc
+
+    results.sort(key=lambda x: x[2], reverse=True)
+    return results, (X_train, X_val, y_train, y_val), sgd_model, sgd_auc
+
+
+# ---------------------------
+# Main
+# ---------------------------
+def main():
+    if not os.path.exists(LOCAL_CSV):
+        raise FileNotFoundError(LOCAL_CSV)
+
+    print("Loading data...")
+    df = load_telco(LOCAL_CSV)
+
+    print("Building preprocessor...")
+    preprocessor, X, y, numf, catf = build_preprocessor(df)
+
+    print("Training sklearn models...")
+    sk_results, splits, sgd_model, sgd_auc = train_sklearn_models(preprocessor, X, y)
+    best_name, best_model, best_auc = sk_results[0]
+
+    X_train, X_val, y_train, y_val = splits
+
+    print("Preparing Keras data...")
+    X_train_np, X_val_np, feature_names = make_numpy_for_keras(
+        preprocessor, X_train, X_val
+    )
+
+    print("Training Keras model...")
+    model = build_keras_model(X_train_np.shape[1])
+    grad_tracker = GradientTracker(model, X_train_np[:256], y_train.values[:256])
+
+    history = model.fit(
+        X_train_np,
+        y_train.values,
+        validation_data=(X_val_np, y_val.values),
+        epochs=20,
+        batch_size=256,
+        callbacks=[grad_tracker],
+        verbose=1,
+    )
+
+    with open("keras_gradients.json", "w") as f:
+        json.dump(grad_tracker.history, f, indent=2)
+
+    y_pred = model.predict(X_val_np).ravel()
+    keras_auc = roc_auc_score(y_val, y_pred)
+    keras_acc = accuracy_score(y_val, (y_pred >= 0.5).astype(int))
+
+    print("\n=== SUMMARY ===")
+    print(f"Best sklearn: {best_name} AUC={best_auc:.4f}")
+    print(f"Keras:        AUC={keras_auc:.4f}, ACC={keras_acc:.4f}")
+    print(f"SGD AUC:      {sgd_auc:.4f}")
+
+    final_model_name = best_name if best_auc >= keras_auc else "keras_mlp"
+    final_auc = max(best_auc, keras_auc)
+
+    print(f"\nFINAL MODEL: {final_model_name} (AUC={final_auc:.4f})")
+
+    leaderboard = []
+    for name, model_obj, auc_val in sk_results:
+        leaderboard.append({"name": name, "type": "sklearn", "auc": float(auc_val)})
+
+    leaderboard.append(
+        {
+            "name": "keras_mlp",
+            "type": "keras",
+            "auc": float(keras_auc),
+            "accuracy": float(keras_acc),
+        }
+    )
+
+    with open("model_leaderboard_telco.json", "w") as f:
+        json.dump(leaderboard, f, indent=2)
+
+    # ---------------------------
+    # SAVE PIPELINE FOR PREDICTION
+    # ---------------------------
+    joblib.dump(sgd_model, "sgd_pipeline.pkl")
+    print("\nSaved sgd_pipeline.pkl — used by your local prediction pipeline.")
+
+
+if __name__ == "__main__":
+    main()
